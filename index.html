@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>웹캠 슈팅</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", "Malgun Gothic", sans-serif;
+    background: #0b0d14;
+    color: #e8eaf0;
+    display: flex;
+    justify-content: center;
+    padding: 24px 16px;
+  }
+  .wrap { display: flex; gap: 24px; flex-wrap: wrap; justify-content: center; max-width: 1100px; }
+  h1 { margin: 0 0 12px; font-size: 26px; }
+  .panel {
+    background: #171a24;
+    border-radius: 14px;
+    padding: 18px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.4);
+  }
+  #game { display: block; background: #05060a; border-radius: 8px; max-width: 100%; }
+  .hud { display: flex; justify-content: space-between; margin: 10px 0 0; font-size: 18px; gap: 12px; }
+  .side { width: 320px; max-width: 100%; display: flex; flex-direction: column; gap: 14px; }
+  #webcam-container { width: 100%; aspect-ratio: 1; background: #05060a; border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; color: #6b7280; }
+  #webcam-container canvas { width: 100%; height: 100%; }
+  button {
+    font: inherit; font-size: 16px; padding: 10px 14px; border: 0; border-radius: 8px;
+    background: #38bdf8; color: #05060a; font-weight: 700; cursor: pointer;
+  }
+  button:disabled { background: #374151; color: #9ca3af; cursor: default; }
+  .btns { display: flex; gap: 8px; }
+  .btns button { flex: 1; }
+  .bar-row { display: grid; grid-template-columns: 70px 1fr 48px; align-items: center; gap: 8px; font-size: 14px; margin: 4px 0; }
+  .bar { height: 14px; background: #05060a; border-radius: 7px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: #60a5fa; transition: width .1s; }
+  .bar-row.active .bar > div { background: #fbbf24; }
+  .bar-row.active { font-weight: 700; }
+  .action { font-size: 22px; text-align: center; font-weight: 700; min-height: 30px; }
+  label { font-size: 14px; display: block; }
+  input[type=range] { width: 100%; }
+  .status { font-size: 13px; color: #9ca3af; min-height: 18px; }
+  .warn { color: #fbbf24; }
+  table.help { width: 100%; font-size: 14px; border-collapse: collapse; }
+  table.help td { padding: 3px 0; }
+  table.help td:first-child { color: #9ca3af; width: 80px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="panel">
+    <h1>🚀 웹캠 슈팅</h1>
+    <canvas id="game" width="480" height="640"></canvas>
+    <div class="hud">
+      <span>점수 <b id="score">0</b></span>
+      <span>목숨 <b id="lives">❤❤❤</b></span>
+      <span>최고 <b id="best">0</b></span>
+    </div>
+  </div>
+
+  <div class="side">
+    <div class="panel">
+      <div id="webcam-container">웹캠 꺼짐</div>
+      <div class="status" id="status">‘웹캠 시작’을 눌러 모델을 불러오세요.</div>
+      <div class="btns" style="margin-top:8px">
+        <button id="camBtn">웹캠 시작</button>
+        <button id="startBtn">게임 시작</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="action" id="action">-</div>
+      <div id="bars" style="margin-top:10px"></div>
+    </div>
+
+    <div class="panel">
+      <table class="help">
+        <tr><td>left / right</td><td>좌우 이동</td></tr>
+        <tr><td>up</td><td>발사</td></tr>
+        <tr><td>down</td><td>방어막 (쿨타임 5초)</td></tr>
+        <tr><td>neutral</td><td>정지</td></tr>
+      </table>
+      <label style="margin-top:12px">인식 임계값: <b id="thrVal">0.80</b>
+        <input type="range" id="thr" min="0.5" max="0.99" step="0.01" value="0.8">
+      </label>
+      <div class="status" style="margin-top:6px">키보드: ← → 이동, ↑ 발사, ↓ 방어막, 스페이스 시작·일시정지</div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
+<script>
+const MODEL_URL = "https://teachablemachine.withgoogle.com/models/mHcJOHjdd/";
+
+// ---------- 입력 ----------
+// 모델 인식 결과와 키보드 입력을 합쳐서 현재 행동을 정한다.
+let modelAction = "neutral";
+const keys = {};
+const ACTION_LABEL = { left: "⬅️ 이동", right: "➡️ 이동", up: "🔫 발사", down: "🛡️ 방어막", neutral: "✋ 정지" };
+
+function currentAction() {
+  if (keys.ArrowLeft) return "left";
+  if (keys.ArrowRight) return "right";
+  if (keys.ArrowUp) return "up";
+  if (keys.ArrowDown) return "down";
+  return modelAction;
+}
+
+// ---------- 게임 ----------
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = canvas.width, H = canvas.height;
+
+const SHIELD_TIME = 1.5, SHIELD_COOLDOWN = 5, FIRE_INTERVAL = 0.18;
+let player, bullets, enemies, enemyBullets, particles, score, lives, elapsed, spawnTimer;
+let running = false, gameOver = false, lastTime = 0;
+let best = Number(localStorage.getItem("shooterBest") || 0);
+document.getElementById("best").textContent = best;
+
+const stars = Array.from({ length: 80 }, () => ({
+  x: Math.random() * W, y: Math.random() * H, s: Math.random() * 1.8 + 0.3, v: Math.random() * 60 + 20,
+}));
+
+function resetGame() {
+  player = { x: W / 2, y: H - 60, r: 18, speed: 300, fireCd: 0, shield: 0, shieldCd: 0, hurt: 0 };
+  bullets = []; enemies = []; enemyBullets = []; particles = [];
+  score = 0; lives = 3; elapsed = 0; spawnTimer = 1;
+  gameOver = false;
+  updateHud();
+}
+
+function updateHud() {
+  document.getElementById("score").textContent = score;
+  document.getElementById("lives").textContent = lives > 0 ? "❤".repeat(lives) : "-";
+}
+
+function difficulty() { return 1 + elapsed / 30; } // 30초마다 1단계씩 어려워짐
+
+function spawnEnemy() {
+  const d = difficulty();
+  const roll = Math.random();
+  let e;
+  if (roll < 0.15 && elapsed > 20) {
+    // 큰 적: 체력 많고 총을 쏨
+    e = { type: "big", r: 26, hp: 5, speed: 50 + 10 * d, color: "#f472b6", points: 50, shootCd: 1.5 };
+  } else if (roll < 0.45) {
+    // 지그재그 적
+    e = { type: "zig", r: 16, hp: 1, speed: 90 + 20 * d, color: "#a78bfa", points: 20, phase: Math.random() * 6 };
+  } else {
+    e = { type: "basic", r: 16, hp: 1, speed: 80 + 25 * d, color: "#f87171", points: 10 };
+  }
+  e.x = e.r + Math.random() * (W - e.r * 2);
+  e.baseX = e.x;
+  e.y = -e.r;
+  e.maxHp = e.hp;
+  enemies.push(e);
+}
+
+function explode(x, y, color, n = 16) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, v = Math.random() * 180 + 40;
+    particles.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0.6, color });
+  }
+}
+
+function hitPlayer() {
+  if (player.shield > 0 || player.hurt > 0) return;
+  lives--;
+  player.hurt = 1.5; // 잠깐 무적
+  explode(player.x, player.y, "#38bdf8", 24);
+  updateHud();
+  if (lives <= 0) endGame();
+}
+
+function update(dt) {
+  elapsed += dt;
+  const action = currentAction();
+
+  // 플레이어
+  if (action === "left") player.x -= player.speed * dt;
+  if (action === "right") player.x += player.speed * dt;
+  player.x = Math.max(player.r, Math.min(W - player.r, player.x));
+
+  player.fireCd -= dt;
+  if (action === "up" && player.fireCd <= 0) {
+    bullets.push({ x: player.x, y: player.y - player.r, v: 600 });
+    player.fireCd = FIRE_INTERVAL;
+  }
+
+  player.shieldCd = Math.max(0, player.shieldCd - dt);
+  player.shield = Math.max(0, player.shield - dt);
+  player.hurt = Math.max(0, player.hurt - dt);
+  if (action === "down" && player.shieldCd <= 0) {
+    player.shield = SHIELD_TIME;
+    player.shieldCd = SHIELD_COOLDOWN;
+  }
+
+  // 적 생성
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) {
+    spawnEnemy();
+    spawnTimer = Math.max(0.35, 1.4 / difficulty()) * (0.6 + Math.random() * 0.8);
+  }
+
+  // 총알
+  bullets.forEach(b => b.y -= b.v * dt);
+  bullets = bullets.filter(b => b.y > -10);
+
+  // 적 이동 & 사격
+  for (const e of enemies) {
+    e.y += e.speed * dt;
+    if (e.type === "zig") {
+      e.phase += dt * 3;
+      e.x = Math.max(e.r, Math.min(W - e.r, e.baseX + Math.sin(e.phase) * 70));
+    }
+    if (e.type === "big") {
+      e.shootCd -= dt;
+      if (e.shootCd <= 0 && e.y > 0) {
+        const a = Math.atan2(player.y - e.y, player.x - e.x);
+        enemyBullets.push({ x: e.x, y: e.y, vx: Math.cos(a) * 220, vy: Math.sin(a) * 220 });
+        e.shootCd = 2 / Math.sqrt(difficulty());
+      }
+    }
+  }
+
+  // 총알 ↔ 적 충돌
+  for (const b of bullets) {
+    for (const e of enemies) {
+      if (e.hp > 0 && Math.hypot(b.x - e.x, b.y - e.y) < e.r + 4) {
+        e.hp--;
+        b.dead = true;
+        if (e.hp <= 0) {
+          score += e.points;
+          updateHud();
+          explode(e.x, e.y, e.color);
+        } else {
+          explode(b.x, b.y, "#fde68a", 4);
+        }
+        break;
+      }
+    }
+  }
+  bullets = bullets.filter(b => !b.dead);
+
+  // 적 ↔ 플레이어 충돌, 바닥 통과
+  for (const e of enemies) {
+    if (e.hp <= 0) continue;
+    if (Math.hypot(e.x - player.x, e.y - player.y) < e.r + player.r * 0.8) {
+      e.hp = 0;
+      explode(e.x, e.y, e.color);
+      hitPlayer();
+    } else if (e.y - e.r > H) {
+      e.hp = 0;
+      score = Math.max(0, score - 5); // 놓치면 감점
+      updateHud();
+    }
+  }
+  enemies = enemies.filter(e => e.hp > 0);
+
+  // 적 총알
+  for (const b of enemyBullets) {
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    if (Math.hypot(b.x - player.x, b.y - player.y) < player.r * 0.8) {
+      b.dead = true;
+      hitPlayer();
+    }
+  }
+  enemyBullets = enemyBullets.filter(b => !b.dead && b.y < H + 10 && b.y > -10 && b.x > -10 && b.x < W + 10);
+
+  // 파티클
+  for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt; }
+  particles = particles.filter(p => p.life > 0);
+}
+
+function updateStars(dt) {
+  for (const s of stars) {
+    s.y += s.v * dt;
+    if (s.y > H) { s.y = 0; s.x = Math.random() * W; }
+  }
+}
+
+function drawShip() {
+  if (player.hurt > 0 && Math.floor(player.hurt * 10) % 2 === 0) return; // 피격 깜빡임
+  const { x, y, r } = player;
+  ctx.fillStyle = "#38bdf8";
+  ctx.beginPath();
+  ctx.moveTo(x, y - r);
+  ctx.lineTo(x + r, y + r);
+  ctx.lineTo(x, y + r * 0.5);
+  ctx.lineTo(x - r, y + r);
+  ctx.closePath();
+  ctx.fill();
+  // 엔진 불꽃
+  ctx.fillStyle = "#fb923c";
+  ctx.beginPath();
+  ctx.moveTo(x - 5, y + r * 0.6);
+  ctx.lineTo(x + 5, y + r * 0.6);
+  ctx.lineTo(x, y + r + 6 + Math.random() * 6);
+  ctx.closePath();
+  ctx.fill();
+
+  if (player.shield > 0) {
+    ctx.strokeStyle = `rgba(125, 211, 252, ${0.4 + 0.4 * Math.sin(performance.now() / 60)})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(x, y, r + 12, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+}
+
+function drawEnemy(e) {
+  ctx.fillStyle = e.color;
+  ctx.beginPath();
+  if (e.type === "zig") {
+    ctx.moveTo(e.x, e.y + e.r);
+    ctx.lineTo(e.x + e.r, e.y);
+    ctx.lineTo(e.x, e.y - e.r);
+    ctx.lineTo(e.x - e.r, e.y);
+  } else {
+    ctx.moveTo(e.x - e.r, e.y - e.r * 0.6);
+    ctx.lineTo(e.x + e.r, e.y - e.r * 0.6);
+    ctx.lineTo(e.x, e.y + e.r);
+  }
+  ctx.closePath();
+  ctx.fill();
+  if (e.maxHp > 1) {
+    ctx.fillStyle = "#374151";
+    ctx.fillRect(e.x - e.r, e.y - e.r - 8, e.r * 2, 4);
+    ctx.fillStyle = "#4ade80";
+    ctx.fillRect(e.x - e.r, e.y - e.r - 8, e.r * 2 * (e.hp / e.maxHp), 4);
+  }
+}
+
+function draw() {
+  ctx.fillStyle = "#05060a";
+  ctx.fillRect(0, 0, W, H);
+  for (const s of stars) {
+    ctx.fillStyle = `rgba(255,255,255,${s.s / 2.2})`;
+    ctx.fillRect(s.x, s.y, s.s, s.s);
+  }
+
+  ctx.fillStyle = "#fde047";
+  for (const b of bullets) ctx.fillRect(b.x - 2, b.y - 8, 4, 12);
+
+  ctx.fillStyle = "#fb7185";
+  for (const b of enemyBullets) { ctx.beginPath(); ctx.arc(b.x, b.y, 5, 0, Math.PI * 2); ctx.fill(); }
+
+  enemies.forEach(drawEnemy);
+
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life / 0.6);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+  }
+  ctx.globalAlpha = 1;
+
+  if (lives > 0) drawShip();
+
+  // 방어막 쿨타임 표시
+  ctx.fillStyle = "#1f2937";
+  ctx.fillRect(12, H - 18, 100, 6);
+  ctx.fillStyle = player.shieldCd > 0 ? "#64748b" : "#7dd3fc";
+  ctx.fillRect(12, H - 18, 100 * (1 - player.shieldCd / SHIELD_COOLDOWN), 6);
+  ctx.fillStyle = "#9ca3af";
+  ctx.font = "11px 'Malgun Gothic', sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText("방어막", 12, H - 24);
+
+  if (!running) {
+    ctx.fillStyle = "rgba(0,0,0,.6)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "center";
+    ctx.font = "bold 34px 'Malgun Gothic', sans-serif";
+    ctx.fillText(gameOver ? "GAME OVER" : (elapsed > 0 ? "일시정지" : "준비"), W / 2, H / 2 - 10);
+    ctx.font = "16px 'Malgun Gothic', sans-serif";
+    ctx.fillText(gameOver ? `점수 ${score} · 다시 시작을 누르세요` : "게임 시작 버튼 또는 스페이스", W / 2, H / 2 + 24);
+  }
+}
+
+function frame(t) {
+  const dt = Math.min(0.05, (t - lastTime) / 1000 || 0);
+  lastTime = t;
+  updateStars(dt);
+  if (running) update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+function endGame() {
+  running = false;
+  gameOver = true;
+  if (score > best) {
+    best = score;
+    localStorage.setItem("shooterBest", best);
+    document.getElementById("best").textContent = best;
+  }
+  document.getElementById("startBtn").textContent = "다시 시작";
+}
+
+function toggleGame() {
+  const btn = document.getElementById("startBtn");
+  if (running) {
+    running = false;
+    btn.textContent = "계속";
+  } else {
+    if (gameOver) resetGame();
+    running = true;
+    btn.textContent = "일시정지";
+  }
+}
+
+// ---------- 티처블 머신 ----------
+let model, webcam, labels = [];
+const barEls = {};
+
+async function initCam() {
+  const camBtn = document.getElementById("camBtn");
+  const status = document.getElementById("status");
+  camBtn.disabled = true;
+  try {
+    status.textContent = "모델 불러오는 중...";
+    model = await tmImage.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
+    labels = model.getClassLabels();
+
+    status.textContent = "웹캠 켜는 중...";
+    webcam = new tmImage.Webcam(240, 240, true);
+    await webcam.setup();
+    await webcam.play();
+
+    const container = document.getElementById("webcam-container");
+    container.innerHTML = "";
+    container.appendChild(webcam.canvas);
+
+    buildBars();
+    status.textContent = "클래스: " + labels.join(", ");
+    camBtn.textContent = "웹캠 켜짐";
+    predictLoop();
+  } catch (e) {
+    console.error(e);
+    status.innerHTML = '<span class="warn">오류: ' + e.message +
+      '<br>웹캠 권한을 허용했는지, https 주소로 열었는지 확인하세요.</span>';
+    camBtn.disabled = false;
+  }
+}
+
+function buildBars() {
+  const bars = document.getElementById("bars");
+  bars.innerHTML = "";
+  labels.forEach(l => {
+    const row = document.createElement("div");
+    row.className = "bar-row";
+    row.innerHTML = `<span>${l}</span><div class="bar"><div></div></div><span>0%</span>`;
+    bars.appendChild(row);
+    barEls[l] = row;
+  });
+}
+
+async function predictLoop() {
+  webcam.update();
+  const preds = await model.predict(webcam.canvas);
+  const threshold = Number(document.getElementById("thr").value);
+  let top = preds[0];
+  for (const p of preds) if (p.probability > top.probability) top = p;
+
+  for (const p of preds) {
+    const row = barEls[p.className];
+    if (!row) continue;
+    row.querySelector(".bar > div").style.width = (p.probability * 100).toFixed(0) + "%";
+    row.lastElementChild.textContent = (p.probability * 100).toFixed(0) + "%";
+    row.classList.toggle("active", p === top && p.probability >= threshold);
+  }
+
+  const name = top.className.trim().toLowerCase();
+  modelAction = top.probability >= threshold && ACTION_LABEL[name] ? name : "neutral";
+  document.getElementById("action").textContent = ACTION_LABEL[modelAction];
+  requestAnimationFrame(predictLoop);
+}
+
+// ---------- 이벤트 ----------
+document.getElementById("camBtn").addEventListener("click", initCam);
+document.getElementById("startBtn").addEventListener("click", e => { toggleGame(); e.target.blur(); });
+
+const thr = document.getElementById("thr");
+thr.addEventListener("input", () => document.getElementById("thrVal").textContent = Number(thr.value).toFixed(2));
+
+document.addEventListener("keydown", e => {
+  if (e.key.startsWith("Arrow")) { e.preventDefault(); keys[e.key] = true; }
+  if (e.code === "Space") { e.preventDefault(); toggleGame(); }
+});
+document.addEventListener("keyup", e => { keys[e.key] = false; });
+
+resetGame();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
